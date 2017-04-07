@@ -1,6 +1,7 @@
 from os import path
 import re
 import time
+import urllib2
 
 import arrow
 from jsonschema import Draft4Validator
@@ -28,6 +29,9 @@ SUCCESS, WARNINGS, FAILURE, SKIPPED, EXCEPTION, RETRY, CANCELLED = range(7)
 
 # Where we can get the list of all the buildbot state
 ALL_THE_THINGS_URL = "https://secure.pub.build.mozilla.org/builddata/reports/allthethings.json"
+
+# Regular regression to match the log line containing the buildbot-try S3 uploader task
+buildbot_try_task_matcher = re.compile(r'Resolving (\w+), run ([0-9]+). Full task:')
 
 
 def matches_pattern(s, patterns):
@@ -212,15 +216,35 @@ class BuildbotListener(ListenerService):
             expires = self.tc_queue.task(taskid)['expires']
             createJsonArtifact(self.tc_queue, taskid, runid, "public/properties.json", properties, expires)
             if "log_url" in properties:
+                log_url = properties["log_url"][0]
                 # All logs uploaded by Buildbot are gzipped
                 try:
-                        createReferenceArtifact(
-                            self.tc_queue, taskid, runid,
-                            "public/logs/live_backing.log.gz",
-                            properties["log_url"][0], expires,
-                            "application/gzip")
+                    createReferenceArtifact(
+                        self.tc_queue, taskid, runid,
+                        "public/logs/live_backing.log.gz",
+                        log_url, expires,
+                        "application/gzip")
                 except (TypeError, IndexError):
                     log.exception("Unable to create log artifact")
+
+                try:
+                    bbTryTaskId, bbTryRunId = self.parseLog(log_url)
+                    resp = self.tc_queue.listArtifacts(bbTryTaskId, bbTryRunId)
+                    # not doing paging stuff because I don't believe we will ever have more than 1000 artifacts
+                    for artifact in resp['artifacts']:
+                        url = 'https://queue.taskcluster.net/v1/task/{}/runs/{}/artifacts/{}'\
+                                .format(bbTryTaskId, bbTryRunId, artifact['name'])
+                        createReferenceArtifact(
+                            self.tc_queue,
+                            taskid,
+                            runid,
+                            artifact['name'],
+                            url,
+                            artifact['expires'],
+                            artifact['content_type'],
+                        )
+                except (TaskclusterRestFailure, EOFError, urllib2.URLError) as e:
+                    log.exception("Cannot upload artifacts for task %s: %s", e, taskid)
         except TaskclusterRestFailure as e:
             log.exception("buildrequest %s: task %s: caught exception when creating an artifact (Task is probably already completed), not retrying...",
                           brid, taskid)
@@ -288,6 +312,16 @@ class BuildbotListener(ListenerService):
             self.bbb_db.deleteBuildRequest(brid)
         else:
             log.info("buildrequest %s: task %s: WEIRD: Got unknown results %s, ignoring it...", brid, taskid, results)
+
+    # Parse the BB log looking for a line with the upload S3 task
+    def parseLog(self, log_url):
+        with urllib2.urlopen(log_url) as r:
+            for line in r:
+                m = buildbot_try_task_matcher.search(line)
+                if m:
+                    taskid, run = m.group(1, 2)
+                    return taskid, int(run)
+        raise EOFError("buildbot-try task not found in the logs")
 
 
 class Reflector(ServiceBase):

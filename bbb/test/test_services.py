@@ -1,5 +1,6 @@
-from mock import Mock, patch
+from mock import Mock, MagicMock, patch, call
 import unittest
+import urllib2
 
 import arrow
 import sqlalchemy as sa
@@ -247,6 +248,103 @@ INSERT INTO builds
         self.assertEqual(self.bblistener.tc_queue.reportFailed.call_count, 1)
         # Build and Task are done - should be deleted from our db.
         self.assertEqual(self.tasks.count().where(self.tasks.c.buildrequestId == 1).execute().first()[0], 0)
+
+    @patch("{}.urlopen".format(urllib2.__name__))
+    def testHandleFinishedWithArtifacts(self, urlopen):
+        taskid = makeTaskId()
+        self.buildbot_db.execute(sa.text("""
+INSERT INTO buildrequests
+    (id, buildsetid, buildername, submitted_at, complete, complete_at, results)
+    VALUES (1, 0, "good", 5, 1, 30, 0);"""))
+        self.buildbot_db.execute(sa.text("""
+INSERT INTO builds
+    (id, number, brid, start_time, finish_time)
+    VALUES (1, 1, 1, 15, 30);"""))
+        self.tasks.insert().execute(
+            buildrequestId=1,
+            taskId=taskid,
+            runId=0,
+            createdDate=5,
+            processedDate=10,
+            takenUntil=100,
+        )
+
+        # Mock urllib2 to return the expected log line
+        urlopenRet = MagicMock()
+        logIter = MagicMock()
+        logIter.__iter__.return_value = ["Resolving def345, run 0. Full task:"]
+        urlopenRet.__enter__.return_value = logIter
+        urlopen.return_value = urlopenRet
+
+        queue = self.bblistener.tc_queue
+        queue.createArtifact.return_value = {
+            "storageType": "s3",
+            "putUrl": "http://foo.com",
+        }
+        queue.listArtifacts.return_value = {
+            "artifacts": [
+                {
+                    "name": "public/file1",
+                    "content_type": "text/plain",
+                    "expires": "2099-12-25:00:00:00",
+                },
+                {
+                    "name": "public/file2",
+                    "content_type": "text/plain",
+                    "expires": "2099-12-25:00:00:00",
+                },
+            ]
+        }
+
+        data = {
+            "payload": {
+                "build": {
+                    "number": 1,
+                    "builderName": "good",
+                    "properties": [
+                        ("request_ids", (1,), "postrun.py"),
+                        ("taskId", "abc123", "test"),
+                        ("log_url", "http://foo.com", "test"),
+                    ],
+                    "results": SUCCESS,
+                }
+            },
+            "_meta": {
+                "master_name": "a",
+                "master_incarnation": "b",
+            },
+        }
+
+        self.bblistener.handleFinished(data, Mock())
+
+        self.assertEqual(queue.createArtifact.call_count, 4)
+        taskid = unicode(taskid)
+        queue.createArtifact.assert_has_calls([
+            call(taskid, 0, "public/properties.json", {
+                "storageType": "s3",
+                "contentType": "application/json",
+                "expires": "2099-12-25:00:00:00",
+            }),
+            call(taskid, 0, "public/logs/live_backing.log.gz", {
+                "storageType": "reference",
+                "contentType": "application/gzip",
+                "expires": "2099-12-25:00:00:00",
+                "url": "http://foo.com",
+            }),
+            call(taskid, 0, "public/file1", {
+                "storageType": "reference",
+                "contentType": "text/plain",
+                "expires": "2099-12-25:00:00:00",
+                "url": "https://queue.taskcluster.net/v1/task/def345/runs/0/artifacts/public/file1",
+            }),
+            call(taskid, 0, "public/file2", {
+                "storageType": "reference",
+                "contentType": "text/plain",
+                "expires": "2099-12-25:00:00:00",
+                "url": "https://queue.taskcluster.net/v1/task/def345/runs/0/artifacts/public/file2",
+            }),
+        ], any_order=True)
+        self.assertEqual(queue.reportCompleted.call_count, 1)
 
     def testHandleFinishedFailed(self):
         self._handleFinishedTest(FAILURE)
